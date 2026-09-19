@@ -18,7 +18,6 @@ from config import load_config
 from conversation import Conversation, ChatLine
 from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, ReadTimeout
 from rich.logging import RichHandler
-import copy
 from collections import defaultdict
 from http.client import RemoteDisconnected
 
@@ -335,7 +334,7 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
                     elif is_correspondence:
                         best_move, ponder_move = choose_move_time(engine, board, game, correspondence_move_time)
                     else:
-                        best_move, ponder_move = get_pondering_result(engine, game, board.move_stack, ponder_thread, ponder_usi)
+                        best_move, ponder_move = get_pondering_result(engine, game, board, ponder_thread, ponder_usi)
                         move_attempted = True
                         if best_move is None:
                             best_move, ponder_move = play_midgame_move(engine, board, upd["btime"], upd["wtime"], move_overhead, start_time, logger, game)
@@ -406,33 +405,30 @@ def adjust_game_time(btime, wtime, board, move_overhead, start_time, binc=0, win
 def start_pondering(engine, board, best_move, ponder_move, btime, wtime, game, logger, move_overhead, start_time, can_ponder):
     if not can_ponder or ponder_move is None:
         return None, None
-    ponder_board = copy.deepcopy(board)
-    if game.variant_name == "Standard":
-        ponder_board.push(shogi.Move.from_usi(best_move))
-        ponder_board.push(shogi.Move.from_usi(ponder_move))
-    else:
-        ponder_board.push(shogi.Move.null())
-        ponder_board.push(shogi.Move.null())
+    # game.state still describes the position before best_move, and the main loop replaces it while the
+    # ponder thread runs, so the moves of the pondered position are fixed here.
+    ponder_moves = engine_wrapper.game_moves(game, board) + [best_move, ponder_move]
     ponder_usi = ponder_move
 
-    btime, wtime = adjust_game_time(btime, wtime, board, move_overhead, start_time, game.state["winc"], game.state["binc"], game.state["byo"])
+    btime, wtime = adjust_game_time(btime, wtime, board, move_overhead, start_time, game.state["binc"], game.state["winc"], game.state["byo"])
     logger.info(f"Pondering {ponder_move} for btime {btime} wtime {wtime}")
 
-    def ponder_thread_func(game, engine, board, btime, wtime, binc, winc, byo):
+    def ponder_thread_func(game, engine, board, moves, btime, wtime, binc, winc, byo):
         global ponder_results
-        best_move, ponder_move = engine.search_with_ponder(game, board, btime, wtime, binc, winc, byo, True)
+        best_move, ponder_move = engine.search_with_ponder(game, board, btime, wtime, binc, winc, byo, True, moves)
         ponder_results[game.id] = (best_move, ponder_move)
 
-    ponder_thread = threading.Thread(target=ponder_thread_func, args=(game, engine, ponder_board, btime, wtime, game.state["binc"], game.state["winc"], game.state["byo"]))
+    ponder_thread = threading.Thread(target=ponder_thread_func, args=(game, engine, board, ponder_moves, btime, wtime, game.state["binc"], game.state["winc"], game.state["byo"]))
     ponder_thread.start()
     return ponder_thread, ponder_usi
 
 
-def get_pondering_result(engine, game, moves, ponder_thread, ponder_usi):
+def get_pondering_result(engine, game, board, ponder_thread, ponder_usi):
     if ponder_thread is None:
         return None, None
 
-    if ponder_usi == moves[-1].usi():
+    # Only a Standard board holds real moves; the other variants push null moves onto it.
+    if ponder_usi == engine_wrapper.game_moves(game, board)[-1]:
         engine.ponderhit()
         ponder_thread.join()
         return ponder_results[game.id]

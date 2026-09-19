@@ -49,6 +49,15 @@ class Termination(str, Enum):
     PERPETUALCHECK = "perpetualCheck"
 
 
+def game_moves(game, board):
+    """Moves from game.initial_sfen to the current position, in the notation sent to the engine."""
+    if game.variant_name == "Kyoto shogi":
+        return list(game.state["fairyMoves"])
+    if game.variant_name == "Standard":
+        return [m.usi() for m in board.move_stack]
+    return game.state["moves"].split()
+
+
 class EngineWrapper:
     def __init__(self, go_commands):
         self.go_commands = go_commands
@@ -63,11 +72,10 @@ class EngineWrapper:
         self.engine.set_variant_options(game.variant_name.lower())
         return self.search(sfen, moves, movetime=movetime)
     
-    def search_with_ponder(self, game, board, btime, wtime, binc, winc, byo, ponder=False):
-        if game.variant_name == "Kyoto shogi":
-            moves = game.state["fairyMoves"]
-        else:
-            moves = [m.usi() for m in list(board.move_stack)] if game.variant_name == "Standard" else game.state["moves"].split()
+    def search_with_ponder(self, game, board, btime, wtime, binc, winc, byo, ponder=False, moves=None):
+        # A ponder search passes the moves of the expected position, which game.state does not contain yet.
+        if moves is None:
+            moves = game_moves(game, board)
         sfen = game.initial_sfen
         self.engine.set_variant_options(game.variant_name.lower())
         cmds = self.go_commands
