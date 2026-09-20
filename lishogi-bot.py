@@ -394,11 +394,11 @@ def play_midgame_move(engine, board, btime, wtime, move_overhead, start_time, lo
     return best_move, ponder_move
 
 
-def adjust_game_time(btime, wtime, board, move_overhead, start_time, binc=0, winc=0, byo=0):
+def adjust_game_time(btime, wtime, board, move_overhead, start_time, binc=0, winc=0):
     if board.turn == shogi.BLACK:
-        btime = max(0, btime - move_overhead - int((time.perf_counter_ns() - start_time) / 1000000)) + binc + byo
+        btime = max(0, btime - move_overhead - int((time.perf_counter_ns() - start_time) / 1000000)) + binc
     else:
-        wtime = max(0, wtime - move_overhead - int((time.perf_counter_ns() - start_time) / 1000000)) + winc + byo
+        wtime = max(0, wtime - move_overhead - int((time.perf_counter_ns() - start_time) / 1000000)) + winc
     return btime, wtime
 
 
@@ -410,7 +410,10 @@ def start_pondering(engine, board, best_move, ponder_move, btime, wtime, game, l
     ponder_moves = engine_wrapper.game_moves(game, board) + [best_move, ponder_move]
     ponder_usi = ponder_move
 
-    btime, wtime = adjust_game_time(btime, wtime, board, move_overhead, start_time, game.state["binc"], game.state["winc"], game.state["byo"])
+    # The server adds the increment after this move, so it is added here. The byoyomi is not added: once the main
+    # time is gone lishogi reloads the clock to the byoyomi length on every move, so the reported time already
+    # contains it, and go() strips it from the clock as it does for a normal search.
+    btime, wtime = adjust_game_time(btime, wtime, board, move_overhead, start_time, game.state["binc"], game.state["winc"])
     logger.info(f"Pondering {ponder_move} for btime {btime} wtime {wtime}")
 
     def ponder_thread_func(game, engine, board, moves, btime, wtime, binc, winc, byo):

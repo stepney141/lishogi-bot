@@ -1,11 +1,13 @@
 import importlib
 import threading
+import time
 import types
 
 import pytest
 import shogi
 
 import engine_wrapper
+from engine_ctrl import usi
 
 lishogi_bot = importlib.import_module("lishogi-bot")
 
@@ -102,3 +104,42 @@ def test_other_reply_stops_the_ponder_search_and_discards_its_move(variant_name)
 
     assert engine.engine.commands == ["stop"]
     assert result == (None, None)
+
+
+class WireUSI(usi.Engine):
+    """The real go command builder of engine_ctrl.usi.Engine, with the engine process replaced by a recorder."""
+
+    def __init__(self):
+        self.lines = []
+
+    def set_variant_options(self, variant):
+        pass
+
+    def send(self, line):
+        self.lines.append(line)
+
+    def recv_usi(self):
+        return "bestmove", "resign"
+
+
+def ponder_go_line(btime, wtime, binc, winc, byo):
+    engine = make_engine()
+    engine.engine = WireUSI()
+    game = make_game("Chushogi", PLAYED)
+    game.state.update({"binc": binc, "winc": winc, "byo": byo})
+    thread, _ = lishogi_bot.start_pondering(engine, make_board("Chushogi", PLAYED), "2g2f", "8c8d", btime, wtime, game,
+                                            lishogi_bot.logger, 1000, time.perf_counter_ns(), True)
+    thread.join(5)
+    return [line for line in engine.engine.lines if line.startswith("go ")]
+
+
+def test_ponder_started_in_byoyomi_sends_no_main_time_for_the_own_side():
+    # lishogi reloads the clock to the byoyomi length on every move once the main time is gone,
+    # so the reported 10000 ms is all byoyomi.
+    assert ponder_go_line(10000, 60000, 0, 0, 10000) == ["go ponder btime 0 wtime 50000 byoyomi 10000"]
+
+
+def test_ponder_with_main_time_follows_the_convention_of_a_normal_go():
+    # The next normal go receives the clock after the server added the increment, and strips increment and byoyomi.
+    assert ponder_go_line(60000, 60000, 0, 0, 10000) == ["go ponder btime 49000 wtime 50000 byoyomi 10000"]
+    assert ponder_go_line(60000, 60000, 5000, 5000, 0) == ["go ponder btime 59000 wtime 55000 binc 5000 winc 5000"]
