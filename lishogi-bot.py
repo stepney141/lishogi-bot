@@ -126,9 +126,6 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
     correspondence_pinger.start()
     correspondence_queue = manager.Queue()
     correspondence_queue.put("")
-    ongoing_games = li.get_ongoing_games()
-    startup_correspondence_games = [game["gameId"] for game in ongoing_games if game["perf"] == "correspondence"]
-    startup_ponder_games = [game["gameId"] for game in ongoing_games if not game["isMyTurn"]]
     wait_for_correspondence_ping = False
 
     busy_processes = 0
@@ -177,17 +174,11 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
                         pass
             elif event["type"] == "gameStart":
                 game_id = event["game"]["id"]
-                # future work: do not ponder using play_game if pondering is disabled
-                engine_cfg = config["engine"]
-                if busy_processes >= max_games or (engine_can_ponder(correspondence_cfg, engine_cfg, game_id in startup_correspondence_games) and game_id in startup_ponder_games):
-                    # if during error recovery too many games are in progress, do not panic
-                    logger.info(f'--- Enqueue {config["url"] + game_id}')
-                    if game_id not in startup_correspondence_games:
-                        startup_correspondence_games.append(game_id)
-                elif game_id in startup_correspondence_games:
+                # The game stream identifies the clock, including for variant games.
+                # Existing games also arrive as gameStart events when reconnecting.
+                if busy_processes >= max_games:
                     logger.info(f'--- Enqueue {config["url"] + game_id}')
                     correspondence_queue.put(game_id)
-                    startup_correspondence_games.remove(game_id)
                 else:
                     if queued_processes > 0:
                         queued_processes -= 1
@@ -266,7 +257,7 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
 
     logger.info(f"+++ Playing {game}")
 
-    is_correspondence = game.perf_name == "Correspondence"
+    is_correspondence = game.is_correspondence
     correspondence_cfg = config.get("correspondence") or {}
     correspondence_move_time = correspondence_cfg.get("move_time", 60) * 1000
 
@@ -328,11 +319,14 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
                     fake_thinking(config, board, game)
                     correspondence_disconnect_time = correspondence_cfg.get("disconnect_time", 300)
 
-                    if len(board.move_stack) < 2:
+                    if is_correspondence:
+                        remaining = upd["btime"] if game.is_sente else upd["wtime"]
+                        elapsed = int((time.perf_counter_ns() - start_time) / 1000000)
+                        search_time = min(correspondence_move_time, max(1, remaining - move_overhead - elapsed))
+                        best_move, ponder_move = choose_move_time(engine, board, game, search_time)
+                    elif len(board.move_stack) < 2:
                         # need to hardcode first movetime since Lishogi has 30 sec limit
                         best_move, ponder_move = choose_move_time(engine, board, game, 1000)
-                    elif is_correspondence:
-                        best_move, ponder_move = choose_move_time(engine, board, game, correspondence_move_time)
                     else:
                         best_move, ponder_move = get_pondering_result(engine, game, board, ponder_thread, ponder_usi)
                         move_attempted = True
@@ -351,8 +345,9 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
                 game.ping(config.get("abort_time", 30), (upd[f"{bw}time"] + upd[f"{bw}inc"] + upd["byo"]) / 1000 + 60, correspondence_disconnect_time)
 
             elif u_type == "ping":
-                if is_correspondence and not is_engine_move(game, board) and game.should_disconnect_now():
-                    break
+                if is_correspondence:
+                    if not is_engine_move(game, board) and game.should_disconnect_now():
+                        break
                 elif game.should_abort_now():
                     logger.info(f"Aborting [{game.url()}] by lack of activity")
                     li.abort(game.id)
@@ -370,6 +365,7 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
         except StopIteration:
             break
 
+    response.close()
     engine.stop()
     engine.quit()
 

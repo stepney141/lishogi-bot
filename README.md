@@ -129,16 +129,21 @@ One last option is `go_commands`. Beneath this option, arguments to the USI `go`
 ```
 will append `nodes 1 depth 5 movetime 1000` to the command to start thinking of a move: `go startpos e2e4 e7e5 ...`.
 
-- `abort_time`: How many seconds to wait before aborting a game due to opponent inaction. This only applies during the first six moves of the game.
+- `abort_time`: How many seconds to wait before aborting a real-time game due to opponent inaction. This only applies during the opening. Correspondence games are not aborted for inactivity by the bot.
 - `fake_think_time`: Artificially slow down the engine to simulate a person thinking about a move. The amount of thinking time decreases as the game goes on.
 - `rate_limiting_delay`: For extremely fast games, the [lishogi.org](https://lishogi.org) servers may respond with an error if too many moves are played too quickly. This option avoids this problem by pausing for a specified number of milliseconds after submitting a move before making the next move.
 - `move_overhead`: To prevent losing on time due to network lag, subtract this many milliseconds from the time to think on each move.
 
 - `correspondence` These options control how the engine behaves during correspondence games.
-  - `move_time`: How many seconds to think for each move.
+  - `move_time`: The maximum number of seconds to think for each move, including the first move. Near the deadline, the bot subtracts `move_overhead` and elapsed processing time from its remaining time and reduces the search budget accordingly, with a minimum of 1 millisecond.
   - `checkin_period`: How often (in seconds) to reconnect to games to check for new moves after disconnecting.
   - `disconnect_time`: How many seconds to wait after the bot makes a move for an opponent to make a move. If no move is made during the wait, disconnect from the game.
   - `ponder`: Whether the bot should ponder during the above waiting period.
+
+To accept correspondence games, include `correspondence` in `challenge.time_controls` and set `correspondence.ponder` to `false` when using fixed move times.
+Challenges are classified by `timeControl.type`; game streams are classified by the presence of a clock.
+The `perf` field identifies the rating category and cannot distinguish real-time from correspondence play for variants such as Chu shogi.
+After disconnecting, the bot queues the game for another check. On startup, it opens ongoing games received as `gameStart` events to determine their time control.
 
 - `challenge`: Control what kind of games for which the bot should accept challenges. All of the following options must be satisfied by a challenge to be accepted.
   - `concurrency`: The maximum number of games to play simultaneously.

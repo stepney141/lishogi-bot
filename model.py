@@ -8,8 +8,7 @@ def estimate_total_time(base, incr, byo, pds):
 
     return zero_if_null(base) + 60 * zero_if_null(incr) + 25 * zero_if_null(byo) * max(1, zero_if_null(pds))
 
-def get_speed_from_tc(perf, base, incr, byo, pds): 
-    if perf == "correspondence": return perf
+def get_speed_from_tc(base, incr, byo, pds):
     t = estimate_total_time(base, incr, byo, pds) 
 
     if t < 60: return "ultraBullet"
@@ -24,7 +23,7 @@ class Challenge:
         self.rated = c_info["rated"]
         self.variant = c_info["variant"]["key"]
         self.perf_name = c_info["perf"]["name"]
-        self.speed = c_info.get("speed")
+        self.speed = c_info["timeControl"]["type"]
         self.increment = c_info.get("timeControl", {}).get("increment", -1)
         self.byoyomi = c_info.get("timeControl", {}).get("byoyomi", -1)
         self.periods = c_info.get("timeControl", {}).get("periods", -1)
@@ -37,9 +36,8 @@ class Challenge:
         self.challenger_rating_int = self.challenger["rating"] if self.challenger else 0
         self.challenger_rating = self.challenger_rating_int or "?"
 
-        if self.speed is None: 
+        if self.speed == "clock":
             self.speed = get_speed_from_tc(
-                self.perf_name, 
                 self.base, 
                 self.increment, 
                 self.byoyomi, 
@@ -113,7 +111,7 @@ class Game:
     def __init__(self, json, username, base_url, abort_time):
         self.username = username
         self.id = json.get("id")
-        self.speed = json.get("speed")
+        self.is_correspondence = json["clock"] is None
         clock = json.get("clock") or {}
         self.clock_initial = clock.get("initial", 1000 * 3600 * 24 * 365 * 10) # unlimited = 10 years
         self.clock_increment = clock.get("increment", 0)
@@ -138,15 +136,6 @@ class Game:
         self.abort_at = time.time() + abort_time
         self.terminate_at = time.time() + (self.clock_initial + self.clock_increment + self.clock_byoyomi) / 1000 + abort_time + 60
         self.disconnect_at = time.time()
-
-        if self.speed is None: 
-            self.speed = get_speed_from_tc(
-                self.perf_name, 
-                self.clock_initial, 
-                self.clock_increment, 
-                self.clock_byoyomi, 
-                self.clock_periods
-            )
 
     def url(self):
         return urljoin(self.base_url, f"{self.id}/{self.my_color}")
