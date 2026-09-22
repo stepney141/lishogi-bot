@@ -372,8 +372,7 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
                                 best_move, ponder_move = play_midgame_move(engine, board, upd["btime"], upd["wtime"], move_overhead, start_time, logger, game)
                                 if best_move is None:
                                     best_move, ponder_move = get_online_move(li, board, game, online_moves_cfg)
-                        li.make_move(game.id, best_move)
-                        if can_ponder:
+                        if submit_move(li, game, best_move) and can_ponder:
                             ponder_thread, ponder_usi = start_pondering(engine, board, best_move, ponder_move, upd["btime"], upd["wtime"], game, logger, move_overhead, start_time, can_ponder)
                         time.sleep(delay_seconds)
                     elif len(board.move_stack) == 0:
@@ -435,6 +434,20 @@ def adjust_game_time(btime, wtime, board, move_overhead, start_time, binc=0, win
     else:
         wtime = max(0, wtime - move_overhead - int((time.perf_counter_ns() - start_time) / 1000000)) + winc
     return btime, wtime
+
+
+def submit_move(li, game, best_move):
+    """Send the adopted search result to lishogi.
+
+    A USI engine resigns with "bestmove resign"; that ends the game, so no ponder search may follow it.
+    Returns whether a move was played and a ponder search may start.
+    """
+    if best_move == "resign":
+        logger.info("Resigning")
+        li.resign(game.id)
+        return False
+    li.make_move(game.id, best_move)
+    return True
 
 
 def start_pondering(engine, board, best_move, ponder_move, btime, wtime, game, logger, move_overhead, start_time, can_ponder):
