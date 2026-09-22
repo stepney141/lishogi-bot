@@ -19,6 +19,8 @@ from conversation import Conversation, ChatLine
 from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, ReadTimeout
 from rich.logging import RichHandler
 from collections import defaultdict
+from contextlib import closing
+from functools import partial
 from http.client import RemoteDisconnected
 
 logger = logging.getLogger(__name__)
@@ -55,13 +57,38 @@ def watch_control_stream(control_queue, li):
             with li.get_event_stream() as response:
                 lines = response.iter_lines()
                 for line in lines:
+                    if terminated:
+                        return
                     if line:
                         event = json.loads(line.decode("utf-8"))
                         control_queue.put_nowait(event)
                     else:
                         control_queue.put_nowait({"type": "ping"})
-        except:
-            pass
+        except (HTTPError, ReadTimeout, RemoteDisconnected, ChunkedEncodingError, ConnectionError) as error:
+            logger.warning("Event stream disconnected: %s", error)
+            if is_final(error) and error.response.status_code != 429:
+                raise
+        if not terminated:
+            logger.warning("Reconnecting event stream")
+            time.sleep(1)
+
+
+def watch_game_stream(li, game_id):
+    while not terminated:
+        try:
+            with closing(li.get_game_stream(game_id)) as response:
+                yield from response.iter_lines()
+        except (HTTPError, ReadTimeout, RemoteDisconnected, ChunkedEncodingError, ConnectionError) as error:
+            logger.warning("Game stream %s disconnected: %s", game_id, error)
+            if isinstance(error, HTTPError) and error.response.status_code == 404:
+                return
+            if is_final(error) and error.response.status_code != 429:
+                raise
+        if terminated or game_id not in (game["gameId"] for game in li.get_ongoing_games()):
+            logger.info("Game %s is no longer active; closing stream", game_id)
+            return
+        logger.warning("Reconnecting game stream %s", game_id)
+        time.sleep(1)
 
 
 def do_correspondence_ping(control_queue, period):
@@ -107,8 +134,9 @@ def game_logging_configurer(queue, level):
         root.setLevel(level)
 
 
-def game_error_handler(error):
+def game_error_handler(error, control_queue, game_id):
     logger.error("".join(traceback.format_exception(error)))
+    control_queue.put_nowait({"type": "free_process", "gameId": game_id})
 
 
 def start(li, user_profile, config, logging_level, log_filename, one_game=False):
@@ -128,7 +156,7 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
     correspondence_queue.put("")
     wait_for_correspondence_ping = False
 
-    busy_processes = 0
+    active_games = set()
     queued_processes = 0
 
 
@@ -154,8 +182,8 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
             if event["type"] == "terminated":
                 break
             elif event["type"] == "free_process":
-                busy_processes -= 1
-                logger.info(f"+++ Process Free. Total Queued: {queued_processes}. Total Used: {busy_processes}")
+                active_games.remove(event["gameId"])
+                logger.info(f"+++ Process Free. Total Queued: {queued_processes}. Total Used: {len(active_games)}")
                 if one_game:
                     break
             elif event["type"] == "challenge":
@@ -174,17 +202,20 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
                         pass
             elif event["type"] == "gameStart":
                 game_id = event["game"]["id"]
+                if game_id in active_games:
+                    control_queue.task_done()
+                    continue
                 # The game stream identifies the clock, including for variant games.
                 # Existing games also arrive as gameStart events when reconnecting.
-                if busy_processes >= max_games:
+                if len(active_games) >= max_games:
                     logger.info(f'--- Enqueue {config["url"] + game_id}')
                     correspondence_queue.put(game_id)
                 else:
                     if queued_processes > 0:
                         queued_processes -= 1
-                    busy_processes += 1
-                    logger.info(f"--- Process Used. Total Queued: {queued_processes}. Total Used: {busy_processes}")
-                    pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level], error_callback=game_error_handler)
+                    active_games.add(game_id)
+                    logger.info(f"--- Process Used. Total Queued: {queued_processes}. Total Used: {len(active_games)}")
+                    pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level], error_callback=partial(game_error_handler, control_queue=control_queue, game_id=game_id))
 
             is_correspondence_ping = event["type"] == "correspondence_ping"
             is_free_process = event["type"] == "free_process"
@@ -193,7 +224,7 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
                     correspondence_queue.put("")
 
                 wait_for_correspondence_ping = False
-                while (busy_processes + queued_processes) < max_games:
+                while (len(active_games) + queued_processes) < max_games:
                     game_id = correspondence_queue.get()
                     # stop checking in on games if we have checked in on all games since the last correspondence_ping
                     if not game_id:
@@ -202,18 +233,18 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
                         else:
                             wait_for_correspondence_ping = True
                             break
-                    else:
-                        busy_processes += 1
-                        logger.info(f"--- Process Used. Total Queued: {queued_processes}. Total Used: {busy_processes}")
-                        pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level], error_callback=game_error_handler)
+                    elif game_id not in active_games:
+                        active_games.add(game_id)
+                        logger.info(f"--- Process Used. Total Queued: {queued_processes}. Total Used: {len(active_games)}")
+                        pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level], error_callback=partial(game_error_handler, control_queue=control_queue, game_id=game_id))
 
-            while (queued_processes + busy_processes) < max_games and challenge_queue:  # keep processing the queue until empty or max_games is reached
+            while (queued_processes + len(active_games)) < max_games and challenge_queue:  # keep processing the queue until empty or max_games is reached
                 chlng = challenge_queue.pop(0)
                 try:
                     logger.info(f"Accept {chlng}")
                     queued_processes += 1
                     li.accept_challenge(chlng.id)
-                    logger.info(f"--- Process Queue. Total Queued: {queued_processes}. Total Used: {busy_processes}")
+                    logger.info(f"--- Process Queue. Total Queued: {queued_processes}. Total Used: {len(active_games)}")
                 except (HTTPError, ReadTimeout) as exception:
                     if isinstance(exception, HTTPError) and exception.response.status_code == 404:  # ignore missing challenge
                         logger.info(f"Skip missing {chlng}")
@@ -243,136 +274,144 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
     game_logging_configurer(logging_queue, logging_level)
     logger = logging.getLogger(__name__)
 
-    response = li.get_game_stream(game_id)
-    lines = response.iter_lines()
+    lines = watch_game_stream(li, game_id)
 
     # Initial response of stream will be the full game info. Store it
-    initial_state = json.loads(next(lines).decode("utf-8"))
+    try:
+        initial_state = json.loads(next(lines).decode("utf-8"))
+    except StopIteration:
+        control_queue.put_nowait({"type": "free_process", "gameId": game_id})
+        return
     logger.debug(initial_state)
     game = model.Game(initial_state, user_profile["username"], li.baseUrl, config.get("abort_time", 20))
 
     engine = engine_wrapper.create_engine(config)
-    engine.get_opponent_info(game)
-    conversation = Conversation(game, engine, li, __version__, challenge_queue)
-
-    logger.info(f"+++ Playing {game}")
-
-    is_correspondence = game.is_correspondence
-    correspondence_cfg = config.get("correspondence") or {}
-    correspondence_move_time = correspondence_cfg.get("move_time", 60) * 1000
-
-    engine_cfg = config["engine"]
-    can_ponder = engine_can_ponder(correspondence_cfg, engine_cfg, is_correspondence)
-    move_overhead = config.get("move_overhead", 1000)
-    delay_seconds = config.get("rate_limiting_delay", 0)/1000
-    online_moves_cfg = engine_cfg.get("online_moves", {})
-
     ponder_thread = None
-    ponder_usi = None
+    try:
+        engine.get_opponent_info(game)
+        conversation = Conversation(game, engine, li, __version__, challenge_queue)
 
-    logger.debug(f"Game state: {game.state}")
+        logger.info(f"+++ Playing {game}")
 
-    greeting_cfg = config.get("greeting") or {}
-    keyword_map = defaultdict(str, me=game.me.name, opponent=game.opponent.name)
-    get_greeting = lambda greeting: str(greeting_cfg.get(greeting) or "").format_map(keyword_map)
-    hello = get_greeting("hello")
-    goodbye = get_greeting("goodbye")
+        is_correspondence = game.is_correspondence
+        correspondence_cfg = config.get("correspondence") or {}
+        correspondence_move_time = correspondence_cfg.get("move_time", 60) * 1000
 
-    first_move = True
-    correspondence_disconnect_time = 0
+        engine_cfg = config["engine"]
+        can_ponder = engine_can_ponder(correspondence_cfg, engine_cfg, is_correspondence)
+        move_overhead = config.get("move_overhead", 1000)
+        delay_seconds = config.get("rate_limiting_delay", 0)/1000
+        online_moves_cfg = engine_cfg.get("online_moves", {})
 
-    while not terminated:
-        move_attempted = False
-        try:
-            if first_move:
-                upd = game.state
-                first_move = False
-            else:
-                binary_chunk = next(lines)
-                upd = json.loads(binary_chunk.decode("utf-8")) if binary_chunk else None
+        ponder_usi = None
 
-            logger.debug(f"Update: {upd}")
-            u_type = upd["type"] if upd else "ping"
-            if u_type == "chatLine":
-                conversation.react(ChatLine(upd), game)
-            elif u_type == "gameState":
-                game.state = upd
-                if is_game_over(game):
-                    if game.variant_name == "Kyoto shogi":
-                        engine.report_game_result(game, game.state["fairyMoves"])
-                    else:
-                        engine.report_game_result(game, game.state["moves"].split(" "))
-                    tell_user_game_result(game)
-                    conversation.send_message("player", goodbye)
-                    break
+        logger.debug(f"Game state: {game.state}")
 
-                board = setup_board(game)
-                if is_engine_move(game, board):
-                    if len(board.move_stack) < 2:
-                        conversation.send_message("player", hello)
-                    else:
+        greeting_cfg = config.get("greeting") or {}
+        keyword_map = defaultdict(str, me=game.me.name, opponent=game.opponent.name)
+        get_greeting = lambda greeting: str(greeting_cfg.get(greeting) or "").format_map(keyword_map)
+        hello = get_greeting("hello")
+        goodbye = get_greeting("goodbye")
+
+        first_move = True
+        correspondence_disconnect_time = 0
+
+        while not terminated:
+            move_attempted = False
+            try:
+                if first_move:
+                    upd = game.state
+                    first_move = False
+                else:
+                    binary_chunk = next(lines)
+                    upd = json.loads(binary_chunk.decode("utf-8")) if binary_chunk else None
+
+                if upd and upd["type"] == "gameFull":
+                    upd = upd["state"]
+
+                logger.debug(f"Update: {upd}")
+                u_type = upd["type"] if upd else "ping"
+                if u_type == "chatLine":
+                    conversation.react(ChatLine(upd), game)
+                elif u_type == "gameState":
+                    game.state = upd
+                    if is_game_over(game):
                         if game.variant_name == "Kyoto shogi":
-                            print_move_number(game.state["fairyMoves"])
+                            engine.report_game_result(game, game.state["fairyMoves"])
                         else:
-                            print_move_number(game.state["moves"])
-                    start_time = time.perf_counter_ns()
-                    fake_thinking(config, board, game)
-                    correspondence_disconnect_time = correspondence_cfg.get("disconnect_time", 300)
-
-                    if is_correspondence:
-                        remaining = upd["btime"] if game.is_sente else upd["wtime"]
-                        elapsed = int((time.perf_counter_ns() - start_time) / 1000000)
-                        search_time = min(correspondence_move_time, max(1, remaining - move_overhead - elapsed))
-                        best_move, ponder_move = choose_move_time(engine, board, game, search_time)
-                    elif len(board.move_stack) < 2:
-                        # need to hardcode first movetime since Lishogi has 30 sec limit
-                        best_move, ponder_move = choose_move_time(engine, board, game, 1000)
-                    else:
-                        best_move, ponder_move = get_pondering_result(engine, game, board, ponder_thread, ponder_usi)
-                        move_attempted = True
-                        if best_move is None:
-                            best_move, ponder_move = play_midgame_move(engine, board, upd["btime"], upd["wtime"], move_overhead, start_time, logger, game)
-                            if best_move is None:
-                                best_move, ponder_move = get_online_move(li, board, game, online_moves_cfg)
-                    li.make_move(game.id, best_move)
-                    if can_ponder:
-                        ponder_thread, ponder_usi = start_pondering(engine, board, best_move, ponder_move, upd["btime"], upd["wtime"], game, logger, move_overhead, start_time, can_ponder)
-                    time.sleep(delay_seconds)
-                elif len(board.move_stack) == 0:
-                    correspondence_disconnect_time = correspondence_cfg.get("disconnect_time", 300)
-
-                bw = "b" if board.turn == shogi.BLACK else "w"
-                game.ping(config.get("abort_time", 30), (upd[f"{bw}time"] + upd[f"{bw}inc"] + upd["byo"]) / 1000 + 60, correspondence_disconnect_time)
-
-            elif u_type == "ping":
-                if is_correspondence:
-                    if not is_engine_move(game, board) and game.should_disconnect_now():
+                            engine.report_game_result(game, game.state["moves"].split(" "))
+                        tell_user_game_result(game)
+                        conversation.send_message("player", goodbye)
                         break
-                elif game.should_abort_now():
-                    logger.info(f"Aborting [{game.url()}] by lack of activity")
-                    li.abort(game.id)
-                    break
-                elif game.should_terminate_now():
-                    logger.info(f"Terminating {game.url()} by lack of activity")
-                    if game.is_abortable():
+
+                    board = setup_board(game)
+                    if is_engine_move(game, board):
+                        if len(board.move_stack) < 2:
+                            conversation.send_message("player", hello)
+                        else:
+                            if game.variant_name == "Kyoto shogi":
+                                print_move_number(game.state["fairyMoves"])
+                            else:
+                                print_move_number(game.state["moves"])
+                        start_time = time.perf_counter_ns()
+                        fake_thinking(config, board, game)
+                        correspondence_disconnect_time = correspondence_cfg.get("disconnect_time", 300)
+
+                        if is_correspondence:
+                            remaining = upd["btime"] if game.is_sente else upd["wtime"]
+                            elapsed = int((time.perf_counter_ns() - start_time) / 1000000)
+                            search_time = min(correspondence_move_time, max(1, remaining - move_overhead - elapsed))
+                            best_move, ponder_move = choose_move_time(engine, board, game, search_time)
+                        elif len(board.move_stack) < 2:
+                            # need to hardcode first movetime since Lishogi has 30 sec limit
+                            best_move, ponder_move = choose_move_time(engine, board, game, 1000)
+                        else:
+                            best_move, ponder_move = get_pondering_result(engine, game, board, ponder_thread, ponder_usi)
+                            move_attempted = True
+                            if best_move is None:
+                                best_move, ponder_move = play_midgame_move(engine, board, upd["btime"], upd["wtime"], move_overhead, start_time, logger, game)
+                                if best_move is None:
+                                    best_move, ponder_move = get_online_move(li, board, game, online_moves_cfg)
+                        li.make_move(game.id, best_move)
+                        if can_ponder:
+                            ponder_thread, ponder_usi = start_pondering(engine, board, best_move, ponder_move, upd["btime"], upd["wtime"], game, logger, move_overhead, start_time, can_ponder)
+                        time.sleep(delay_seconds)
+                    elif len(board.move_stack) == 0:
+                        correspondence_disconnect_time = correspondence_cfg.get("disconnect_time", 300)
+
+                    bw = "b" if board.turn == shogi.BLACK else "w"
+                    game.ping(config.get("abort_time", 30), (upd[f"{bw}time"] + upd[f"{bw}inc"] + upd["byo"]) / 1000 + 60, correspondence_disconnect_time)
+
+                elif u_type == "ping":
+                    if is_correspondence:
+                        if not is_engine_move(game, board) and game.should_disconnect_now():
+                            break
+                    elif game.should_abort_now():
+                        logger.info(f"Aborting [{game.url()}] by lack of activity")
                         li.abort(game.id)
+                        break
+                    elif game.should_terminate_now():
+                        logger.info(f"Terminating {game.url()} by lack of activity")
+                        if game.is_abortable():
+                            li.abort(game.id)
+                        break
+            except (HTTPError, ReadTimeout, RemoteDisconnected, ChunkedEncodingError, ConnectionError):
+                if move_attempted:
+                    continue
+                if game.id not in (ongoing_game["gameId"] for ongoing_game in li.get_ongoing_games()):
                     break
-        except (HTTPError, ReadTimeout, RemoteDisconnected, ChunkedEncodingError, ConnectionError):
-            if move_attempted:
-                continue
-            if game.id not in (ongoing_game["gameId"] for ongoing_game in li.get_ongoing_games()):
+            except StopIteration:
                 break
-        except StopIteration:
-            break
 
-    response.close()
-    engine.stop()
-    engine.quit()
+    finally:
+        lines.close()
+        engine.stop()
+        engine.quit()
 
-    if ponder_thread is not None:
-        ponder_thread.join()
+        if ponder_thread is not None:
+            ponder_thread.join()
 
-    engine.kill_process()
+        engine.kill_process()
 
     if is_game_over(game):
         logger.info(f"--- {game.url()} Game over")
@@ -380,7 +419,7 @@ def play_game(li, game_id, control_queue, user_profile, config, challenge_queue,
         logger.info(f"--- Disconnecting from {game.url()}")
         correspondence_queue.put(game_id)
 
-    control_queue.put_nowait({"type": "free_process"})
+    control_queue.put_nowait({"type": "free_process", "gameId": game_id})
 
 
 def play_midgame_move(engine, board, btime, wtime, move_overhead, start_time, logger, game):

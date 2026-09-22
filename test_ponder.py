@@ -110,6 +110,7 @@ class WireUSI(usi.Engine):
     """The real go command builder of engine_ctrl.usi.Engine, with the engine process replaced by a recorder."""
 
     def __init__(self):
+        self.info = {}
         self.lines = []
 
     def set_variant_options(self, variant):

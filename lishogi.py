@@ -25,6 +25,9 @@ ENDPOINTS = {
 
 logger = logging.getLogger(__name__)
 
+# Streams send heartbeat lines even when no player is moving.
+STREAM_TIMEOUT = (10, 30)
+
 
 def rate_limit_check(response):
     if response.status_code == 429:
@@ -101,14 +104,22 @@ class Lishogi:
         return self.api_post(ENDPOINTS["abort"].format(game_id))
 
     def get_event_stream(self):
-        url = urljoin(self.baseUrl, ENDPOINTS["stream_event"])
-        logger.debug("GET %s", url)
-        return requests.get(url, headers=self.header, stream=True)
+        return self._get_stream(ENDPOINTS["stream_event"])
 
     def get_game_stream(self, game_id):
-        url = urljoin(self.baseUrl, ENDPOINTS["stream"].format(game_id))
+        return self._get_stream(ENDPOINTS["stream"].format(game_id))
+
+    def _get_stream(self, path):
+        url = urljoin(self.baseUrl, path)
         logger.debug("GET %s", url)
-        return requests.get(url, headers=self.header, stream=True)
+        response = requests.get(url, headers=self.header, stream=True, timeout=STREAM_TIMEOUT)
+        try:
+            rate_limit_check(response)
+            response.raise_for_status()
+        except HTTPError:
+            response.close()
+            raise
+        return response
 
     def accept_challenge(self, challenge_id):
         return self.api_post(ENDPOINTS["accept"].format(challenge_id))
