@@ -576,7 +576,11 @@ def setup_board(game):
             else:
                 logger.debug(f"Ignoring illegal move {move} on board {board.sfen()}")
     else:
+        # The engine receives game.initial_sfen and the moves, so this board only counts turns with null moves.
+        # It starts from the side to move in the initial SFEN, which a challenge from a position may set to gote.
         board = shogi.Board()
+        if not game.sente_starts:
+            board.turn = shogi.WHITE
         if game.variant_name == "Kyoto shogi":
             for move in game.state["fairyMoves"]:
                 board.push(shogi.Move.null())
