@@ -66,7 +66,7 @@ def test_gote_moves_first_in_a_chushogi_position_where_gote_starts(monkeypatch):
     config = {"engine": {"ponder": False}, "abort_time": 20}
 
     lishogi_bot.play_game.__wrapped__(api, "game", control, {"username": "bot"}, config,
-                                      [], Queue(), Queue(), lambda *_: None, logging.CRITICAL)
+                                      [], Queue(), Queue(), lambda *_: None, logging.CRITICAL, None)
 
     searched_game = engine.search_for.call_args.args[1]
     assert (searched_game.initial_sfen, searched_game.state["moves"]) == (initial_sfen, "")

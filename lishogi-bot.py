@@ -7,6 +7,7 @@ import lishogi
 import logging
 import logging.handlers
 import multiprocessing
+import os
 import signal
 import time
 import backoff
@@ -19,7 +20,7 @@ from conversation import Conversation, ChatLine
 from requests.exceptions import ChunkedEncodingError, ConnectionError, HTTPError, ReadTimeout
 from rich.logging import RichHandler
 from collections import defaultdict
-from contextlib import closing
+from contextlib import closing, contextmanager
 from functools import partial
 from http.client import RemoteDisconnected
 
@@ -104,15 +105,19 @@ def logging_configurer(level, filename):
     all_handlers = [console_handler]
 
     if filename:
-        file_handler = logging.FileHandler(filename, delay=True)
-        FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
-        file_formatter = logging.Formatter(FORMAT)
-        file_handler.setFormatter(file_formatter)
-        all_handlers.append(file_handler)
+        all_handlers.append(log_file_handler(filename))
 
     logging.basicConfig(level=level,
                         handlers=all_handlers,
                         force=True)
+
+
+def log_file_handler(filename):
+    file_handler = logging.FileHandler(filename, delay=True)
+    FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+    file_formatter = logging.Formatter(FORMAT)
+    file_handler.setFormatter(file_formatter)
+    return file_handler
 
 
 def logging_listener_proc(queue, configurer, level, log_filename):
@@ -134,12 +139,35 @@ def game_logging_configurer(queue, level):
         root.setLevel(level)
 
 
+@contextmanager
+def game_log_file(game_id, game_log_dir):
+    """Moves the file output of the root logger to game_log_dir/<game_id>.log while one game runs.
+
+    A game reconnected later appends to the same file. Without game_log_dir the game is logged to the console only.
+    """
+    root = logging.getLogger()
+    bot_handlers = root.handlers[:]
+    game_handlers = [handler for handler in bot_handlers if not isinstance(handler, logging.FileHandler)]
+    game_log = None
+    if game_log_dir:
+        os.makedirs(game_log_dir, exist_ok=True)
+        game_log = log_file_handler(os.path.join(game_log_dir, f"{game_id}.log"))
+        game_handlers.append(game_log)
+    root.handlers[:] = game_handlers
+    try:
+        yield
+    finally:
+        root.handlers[:] = bot_handlers
+        if game_log:
+            game_log.close()
+
+
 def game_error_handler(error, control_queue, game_id):
-    logger.error("".join(traceback.format_exception(error)))
+    logger.error(f"Game {game_id} failed:\n" + "".join(traceback.format_exception(error)))
     control_queue.put_nowait({"type": "free_process", "gameId": game_id})
 
 
-def start(li, user_profile, config, logging_level, log_filename, one_game=False):
+def start(li, user_profile, config, logging_level, log_filename, game_log_dir, one_game=False):
     challenge_config = config["challenge"]
     max_games = challenge_config.get("concurrency", 1)
     logger.info(f"You're now connected to {config['url']} and awaiting challenges.")
@@ -215,7 +243,7 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
                         queued_processes -= 1
                     active_games.add(game_id)
                     logger.info(f"--- Process Used. Total Queued: {queued_processes}. Total Used: {len(active_games)}")
-                    pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level], error_callback=partial(game_error_handler, control_queue=control_queue, game_id=game_id))
+                    pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level, game_log_dir], error_callback=partial(game_error_handler, control_queue=control_queue, game_id=game_id))
 
             is_correspondence_ping = event["type"] == "correspondence_ping"
             is_free_process = event["type"] == "free_process"
@@ -236,7 +264,7 @@ def start(li, user_profile, config, logging_level, log_filename, one_game=False)
                     elif game_id not in active_games:
                         active_games.add(game_id)
                         logger.info(f"--- Process Used. Total Queued: {queued_processes}. Total Used: {len(active_games)}")
-                        pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level], error_callback=partial(game_error_handler, control_queue=control_queue, game_id=game_id))
+                        pool.apply_async(play_game, [li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level, game_log_dir], error_callback=partial(game_error_handler, control_queue=control_queue, game_id=game_id))
 
             while (queued_processes + len(active_games)) < max_games and challenge_queue:  # keep processing the queue until empty or max_games is reached
                 chlng = challenge_queue.pop(0)
@@ -270,8 +298,13 @@ def engine_can_ponder(correspondence_cfg, engine_cfg, is_correspondence):
 
 
 @backoff.on_exception(backoff.expo, BaseException, max_time=600, giveup=is_final)
-def play_game(li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level):
+def play_game(li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue, logging_queue, game_logging_configurer, logging_level, game_log_dir):
     game_logging_configurer(logging_queue, logging_level)
+    with game_log_file(game_id, game_log_dir):
+        run_game(li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue)
+
+
+def run_game(li, game_id, control_queue, user_profile, config, challenge_queue, correspondence_queue):
     logger = logging.getLogger(__name__)
 
     lines = watch_game_stream(li, game_id)
@@ -641,7 +674,8 @@ def start_lishogi_bot():
     parser.add_argument("-u", action="store_true", help="Upgrade your account to a bot account.")
     parser.add_argument("-v", action="store_true", help="Make output more verbose. Include all communication with lishogi.org.")
     parser.add_argument("--config", help="Specify a configuration file (defaults to ./config.yml)")
-    parser.add_argument("-l", "--logfile", help="Record all console output to a log file.", default=None)
+    parser.add_argument("-l", "--logfile", help="Record the console output, except that of games, to a log file.", default=None)
+    parser.add_argument("--game-log-dir", help="Record the console output of each game to <game id>.log in this directory.", default=None)
     args = parser.parse_args()
 
     logging_level = logging.DEBUG if args.v else logging.INFO
@@ -659,7 +693,7 @@ def start_lishogi_bot():
         is_bot = upgrade_account(li)
 
     if is_bot:
-        start(li, user_profile, CONFIG, logging_level, args.logfile)
+        start(li, user_profile, CONFIG, logging_level, args.logfile, args.game_log_dir)
     else:
         logger.error(f"{username} is not a bot account. Please upgrade it to a bot account!")
 
